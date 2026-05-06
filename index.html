@@ -1,14 +1,409 @@
-<html lang="pt-BR"><head>
+<html lang="en"><head>
+<script id="aura-supabase-token-firewall">(function () {
+  if (window.__AURA_SUPABASE_FIREWALL__) return;
+  window.__AURA_SUPABASE_FIREWALL__ = true;
+
+  var SUPABASE_HOST = "hoirqrkdgbmvpwutwuwj.supabase.co";
+  var BLOCKED_KEY_PATTERNS = [
+    /^sb-[a-z0-9-]+-auth-token$/i,
+    /^supabase\.auth\.token$/i
+  ];
+
+  function isBlockedStorageKey(key) {
+    if (typeof key !== "string") return false;
+    for (var i = 0; i < BLOCKED_KEY_PATTERNS.length; i++) {
+      if (BLOCKED_KEY_PATTERNS[i].test(key)) return true;
+    }
+    return false;
+  }
+
+  function toAbsoluteUrl(input) {
+    try {
+      return new URL(input, window.location.href);
+    } catch {
+      return null;
+    }
+  }
+
+  function isSupabaseDestination(input) {
+    var parsed = toAbsoluteUrl(input);
+    if (!parsed) return false;
+    if (SUPABASE_HOST && parsed.host === SUPABASE_HOST) return true;
+    return parsed.host.endsWith(".supabase.co");
+  }
+
+  function pathLooksSensitive(input) {
+    var parsed = toAbsoluteUrl(input);
+    if (!parsed) return false;
+    return /^\/(auth|rest|functions)\/v1\//.test(parsed.pathname || "");
+  }
+
+  function headersContainAuth(headersLike) {
+    if (!headersLike) return false;
+
+    try {
+      if (typeof Headers !== "undefined" && headersLike instanceof Headers) {
+        return !!(headersLike.get("authorization") || headersLike.get("apikey"));
+      }
+    } catch {}
+
+    if (Array.isArray(headersLike)) {
+      for (var i = 0; i < headersLike.length; i++) {
+        var pair = headersLike[i] || [];
+        var name = String(pair[0] || "").toLowerCase();
+        if (name === "authorization" || name === "apikey") return true;
+      }
+      return false;
+    }
+
+    if (typeof headersLike === "object") {
+      var keys = Object.keys(headersLike);
+      for (var j = 0; j < keys.length; j++) {
+        var k = keys[j].toLowerCase();
+        if (k === "authorization" || k === "apikey") return true;
+      }
+    }
+    return false;
+  }
+
+  function requestLooksSensitive(input, init, extraHeaders) {
+    var url = "";
+    try {
+      if (typeof input === "string") {
+        url = input;
+      } else if (input && typeof input.url === "string") {
+        url = input.url;
+      }
+    } catch {}
+
+    var headers =
+      (init && init.headers) ||
+      (input && input.headers) ||
+      extraHeaders ||
+      null;
+    var hasAuthHeaders = headersContainAuth(headers);
+    if (hasAuthHeaders) return true;
+
+    if (!url) return false;
+    if (isSupabaseDestination(url) && pathLooksSensitive(url)) return true;
+    return false;
+  }
+
+  function patchStorage(storage, storageName) {
+    if (!storage) return;
+    var proto = Object.getPrototypeOf(storage);
+    if (!proto || proto.__auraSupabaseFirewallPatched) return;
+
+    var rawGetItem = proto.getItem;
+    var rawSetItem = proto.setItem;
+    var rawRemoveItem = proto.removeItem;
+    var rawClear = proto.clear;
+    var rawKey = proto.key;
+    var rawLengthDescriptor = Object.getOwnPropertyDescriptor(proto, "length");
+    var rawLengthGet = rawLengthDescriptor && rawLengthDescriptor.get;
+
+    function getRawLength(instance) {
+      try {
+        if (rawLengthGet) return Number(rawLengthGet.call(instance) || 0);
+      } catch {}
+      try {
+        return Number(instance.length || 0);
+      } catch {}
+      return 0;
+    }
+
+    function getVisibleKeys(instance) {
+      var visible = [];
+      var total = getRawLength(instance);
+      for (var i = 0; i < total; i++) {
+        var currentKey = rawKey.call(instance, i);
+        if (currentKey && !isBlockedStorageKey(currentKey)) {
+          visible.push(currentKey);
+        }
+      }
+      return visible;
+    }
+
+    function maskBlockedKeyProperty(instance, keyName) {
+      if (!keyName || !isBlockedStorageKey(keyName)) return;
+      try {
+        Object.defineProperty(instance, keyName, {
+          configurable: true,
+          enumerable: false,
+          get: function () {
+            return null;
+          },
+          set: function () {
+            return true;
+          }
+        });
+      } catch {}
+    }
+
+    function syncBlockedKeyProperties(instance) {
+      var total = getRawLength(instance);
+      for (var i = 0; i < total; i++) {
+        var k = rawKey.call(instance, i);
+        if (k) maskBlockedKeyProperty(instance, k);
+      }
+    }
+
+    proto.getItem = function (key) {
+      syncBlockedKeyProperties(this);
+      if (isBlockedStorageKey(String(key))) return null;
+      return rawGetItem.call(this, key);
+    };
+
+    proto.setItem = function (key, value) {
+      if (isBlockedStorageKey(String(key))) return;
+      return rawSetItem.call(this, key, value);
+    };
+
+    proto.removeItem = function (key) {
+      if (isBlockedStorageKey(String(key))) return;
+      return rawRemoveItem.call(this, key);
+    };
+
+    proto.clear = function () {
+      if (typeof rawClear !== "function") return;
+
+      // Preserve blocked keys across clear() to prevent auth token/session wipe.
+      var preservedBlockedEntries = [];
+      var total = getRawLength(this);
+      for (var i = 0; i < total; i++) {
+        var blockedKey = rawKey.call(this, i);
+        if (blockedKey && isBlockedStorageKey(blockedKey)) {
+          preservedBlockedEntries.push([
+            blockedKey,
+            rawGetItem.call(this, blockedKey),
+          ]);
+        }
+      }
+
+      rawClear.call(this);
+
+      for (var j = 0; j < preservedBlockedEntries.length; j++) {
+        var entry = preservedBlockedEntries[j];
+        var key = entry[0];
+        var value = entry[1];
+        if (typeof key === "string" && typeof value === "string") {
+          rawSetItem.call(this, key, value);
+        }
+      }
+
+      syncBlockedKeyProperties(this);
+    };
+
+    proto.key = function (index) {
+      syncBlockedKeyProperties(this);
+      var visible = getVisibleKeys(this);
+      return visible[index] || null;
+    };
+
+    try {
+      Object.defineProperty(proto, "length", {
+        configurable: true,
+        enumerable: false,
+        get: function () {
+          syncBlockedKeyProperties(this);
+          return getVisibleKeys(this).length;
+        }
+      });
+    } catch {}
+
+    var proxyStorage = null;
+    try {
+      proxyStorage = new Proxy(storage, {
+        get: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return null;
+          if (prop === "length") return getVisibleKeys(target).length;
+          if (prop === "key") {
+            return function (index) {
+              var visible = getVisibleKeys(target);
+              return visible[index] || null;
+            };
+          }
+          if (prop === "clear") {
+            return function () {
+              if (typeof rawClear !== "function") return;
+
+              var preservedBlockedEntries = [];
+              var total = getRawLength(target);
+              for (var i = 0; i < total; i++) {
+                var blockedKey = rawKey.call(target, i);
+                if (blockedKey && isBlockedStorageKey(blockedKey)) {
+                  preservedBlockedEntries.push([
+                    blockedKey,
+                    rawGetItem.call(target, blockedKey),
+                  ]);
+                }
+              }
+
+              rawClear.call(target);
+
+              for (var j = 0; j < preservedBlockedEntries.length; j++) {
+                var entry = preservedBlockedEntries[j];
+                var key = entry[0];
+                var value = entry[1];
+                if (typeof key === "string" && typeof value === "string") {
+                  rawSetItem.call(target, key, value);
+                }
+              }
+
+              syncBlockedKeyProperties(target);
+            };
+          }
+
+          var value = target[prop];
+          if (typeof value === "function") return value.bind(target);
+          return value;
+        },
+        set: function (target, prop, value) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return true;
+          target[prop] = value;
+          return true;
+        },
+        has: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return false;
+          return prop in target;
+        },
+        deleteProperty: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return true;
+          try {
+            delete target[prop];
+          } catch {}
+          return true;
+        },
+        ownKeys: function (target) {
+          return getVisibleKeys(target);
+        },
+        getOwnPropertyDescriptor: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) {
+            return undefined;
+          }
+          if (prop === "length") {
+            return {
+              configurable: true,
+              enumerable: false,
+              value: getVisibleKeys(target).length,
+              writable: false
+            };
+          }
+          return Object.getOwnPropertyDescriptor(target, prop);
+        }
+      });
+    } catch {}
+
+    try {
+      if (proxyStorage) {
+        Object.defineProperty(window, storageName, {
+          configurable: true,
+          enumerable: true,
+          get: function () {
+            return proxyStorage;
+          }
+        });
+      }
+    } catch {}
+
+    syncBlockedKeyProperties(storage);
+    proto.__auraSupabaseFirewallPatched = true;
+  }
+
+  function patchCookieAccess() {
+    try {
+      var cookieDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "cookie");
+      if (!cookieDescriptor || !cookieDescriptor.configurable) return;
+
+      Object.defineProperty(document, "cookie", {
+        configurable: true,
+        enumerable: false,
+        get: function () {
+          return "";
+        },
+        set: function () {
+          return true;
+        }
+      });
+    } catch {}
+  }
+
+  function patchFetch() {
+    if (typeof window.fetch !== "function") return;
+    var rawFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      if (requestLooksSensitive(input, init, null)) {
+        return Promise.reject(new Error("Blocked by Aura security policy"));
+      }
+      return rawFetch(input, init);
+    };
+  }
+
+  function patchXHR() {
+    if (typeof XMLHttpRequest === "undefined") return;
+    var rawOpen = XMLHttpRequest.prototype.open;
+    var rawSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+    var rawSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__auraRequestUrl = String(url || "");
+      this.__auraHeaders = {};
+      return rawOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      if (!this.__auraHeaders) this.__auraHeaders = {};
+      this.__auraHeaders[String(name || "").toLowerCase()] = String(value || "");
+      return rawSetHeader.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      if (requestLooksSensitive(this.__auraRequestUrl || "", null, this.__auraHeaders || null)) {
+        throw new Error("Blocked by Aura security policy");
+      }
+      return rawSend.apply(this, arguments);
+    };
+  }
+
+  function patchBeacon() {
+    if (typeof navigator.sendBeacon !== "function") return;
+    var rawBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      if (requestLooksSensitive(url, null, null)) return false;
+      return rawBeacon(url, data);
+    };
+  }
+
+  function patchWebSocket() {
+    if (typeof WebSocket === "undefined") return;
+    var RawWebSocket = WebSocket;
+    window.WebSocket = function (url, protocols) {
+      if (requestLooksSensitive(String(url || ""), null, null)) {
+        throw new Error("Blocked by Aura security policy");
+      }
+      return new RawWebSocket(url, protocols);
+    };
+    window.WebSocket.prototype = RawWebSocket.prototype;
+  }
+
+  patchStorage(window.localStorage, "localStorage");
+  patchStorage(window.sessionStorage, "sessionStorage");
+  patchCookieAccess();
+  patchFetch();
+  patchXHR();
+  patchBeacon();
+  patchWebSocket();
+})();</script>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<title>LUMIFY BARBEARIA | Barbearia Premium</title>
-<meta content="LUMIFY BARBEARIA — Onde a tradição encontra a arte moderna. Experiências premium de cuidado masculino para o cavalheiro distinto." name="description"/>
+<title>Lumify Barbearia | Barbearia Premium</title>
+<meta content="Lumify Barbearia — Onde tradição encontra o ofício moderno. Experiências premium de cuidado masculino em Florianópolis." name="description"/>
 <!-- Fonts -->
 <link href="https://fonts.googleapis.com" rel="preconnect"/>
 <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@300;400;500;600;700&family=Playfair+Display:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet"/>
+<link href="assets/css2_13ddf91fdf43.css" rel="stylesheet"/>
 <!-- Iconify for Solar icons -->
-<script src="https://code.iconify.design/iconify-icon/1.0.7/iconify-icon.min.js"></script>
+<script src="assets/iconify_654a1ef798a3.js"></script>
 <style>
 /* ========== RESET & BASE ========== */
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -273,7 +668,7 @@ transform: translateX(-101%);
 transition: transform 0.4s var(--ease-out-expo);
 }
 .btn-primary:hover::before { transform: translateX(0); }
-.btn-primary span, .btn-primary iconify-icon { position: relative; z-index: 1; }
+.btn-primary span, .btn-primary .iconify { position: relative; z-index: 1; }
 .btn-outline {
 display: inline-flex;
 align-items: center;
@@ -285,11 +680,11 @@ color: var(--white-dim);
 transition: color 0.3s ease;
 }
 .btn-outline:hover { color: var(--gold); }
-.btn-outline iconify-icon {
+.btn-outline .iconify {
 font-size: 1.2rem;
 transition: transform 0.3s ease;
 }
-.btn-outline:hover iconify-icon { transform: translateX(4px); }
+.btn-outline:hover .iconify { transform: translateX(4px); }
 .hero-image {
 position: relative;
 overflow: hidden;
@@ -712,7 +1107,7 @@ justify-content: center;
 gap: 0.3rem;
 margin-bottom: 2rem;
 }
-.testimonial-stars iconify-icon {
+.testimonial-stars .iconify {
 font-size: 1.1rem;
 color: var(--gold);
 }
@@ -981,7 +1376,7 @@ align-items: flex-start;
 gap: 1rem;
 margin-bottom: 1.25rem;
 }
-.footer-contact-item iconify-icon {
+.footer-contact-item .iconify {
 font-size: 1.1rem;
 color: var(--gold);
 margin-top: 0.2rem;
@@ -1190,7 +1585,7 @@ border: none;
 .team { padding: 3rem 1.25rem; }
 .testimonials { padding: 3rem 1.25rem; }
 .testimonial-quote { font-size: 1rem; }
-.testimonial-stars iconify-icon { font-size: 0.9rem; }
+.testimonial-stars .iconify { font-size: 0.9rem; }
 .booking { padding: 3rem 1.25rem; }
 .booking-image { height: 220px; }
 .booking-image::after { display: none; }
@@ -1242,21 +1637,91 @@ border: none;
 ::-webkit-scrollbar-track { background: var(--black); }
 ::-webkit-scrollbar-thumb { background: var(--gold); border-radius: 3px; }
 </style>
-</head>
-<body>
+<script src="assets/resource_3fa48481346f"></script><style data-scroll-fix="true">
+        /* Scroll fixes for offline viewing */
+        html, body {
+            overflow: auto !important;
+            overflow-x: hidden !important;
+            height: auto !important;
+            min-height: 100% !important;
+            scroll-behavior: auto !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+        }
+        
+        /* Force visibility - many sites use JS animations for initial display */
+        body, .wrapper, main, #__next, #app, .page, .content {
+            opacity: 1 !important;
+            visibility: visible !important;
+            transform: none !important;
+        }
+        
+        /* Disable loader/preloader overlays */
+        .loader, .preloader, .loading, [class*="loader"], [class*="preloader"] {
+            display: none !important;
+            opacity: 0 !important;
+        }
+        
+        /* Show elements that might be hidden for animation */
+        .word-inner, .char, .line, [data-aos], [data-scroll],
+        .hero-text span, .hero-fade, [class*="hero"] span {
+            opacity: 1 !important;
+            transform: none !important;
+            visibility: visible !important;
+        }
+        
+        /* Reset Tailwind animation utility classes */
+        .translate-y-full, .translate-x-full, .-translate-y-full, .-translate-x-full,
+        .translate-y-1\/2, .-translate-y-1\/2, .translate-y-\[100\%\], .translate-y-\[110\%\] {
+            transform: none !important;
+        }
+        
+        /* Force visibility on common hidden-for-animation patterns */
+        .opacity-0, [class*="opacity-0"] {
+            opacity: 1 !important;
+        }
+        
+        /* Reset scale transforms used for animations */
+        .scale-0, .scale-50, .scale-75 {
+            transform: none !important;
+        }
+        
+        html.lenis, html.lenis-smooth, 
+        body.lenis, body.lenis-smooth,
+        .lenis-wrapper, .lenis-content,
+        [data-lenis-prevent], [data-scroll-container] {
+            overflow: visible !important;
+            height: auto !important;
+        }
+        
+        /* Fix flex containers that might cut off content */
+        body.flex.items-center,
+        body.flex.justify-center {
+            align-items: flex-start !important;
+            min-height: 100vh;
+            height: auto !important;
+        }
+        
+        /* Ensure main content scrolls */
+        main, #__next, #__nuxt, #app, .main-content {
+            overflow: visible !important;
+            height: auto !important;
+        }
+        </style></head>
+<body class="">
 <!-- Navigation -->
 <nav class="nav" id="nav">
 <a class="nav-logo" href="#">
             LUMIFY <span class="logo-ampersand">&amp;</span> BARBEARIA
         </a>
 <ul class="nav-links">
-<li><a href="#about">Nossa Historia</a></li>
-<li><a href="#services">Servicos</a></li>
+<li><a href="#about">Nossa História</a></li>
+<li class=""><a class="" href="#services">Serviços</a></li>
 <li><a href="#gallery">Galeria</a></li>
-<li><a href="#team">Barbeiros</a></li>
-<li><a href="#testimonials">Avaliacoes</a></li>
+<li><a href="#team">Equipe</a></li>
+<li><a href="#testimonials">Avaliações</a></li>
 </ul>
-<a class="nav-cta" href="#booking">Agendar</a>
+<a class="nav-cta" href="https://wa.me/554888721165" target="_blank">Agendar</a>
 <div class="nav-hamburger" id="hamburger">
 <span></span>
 <span></span>
@@ -1265,41 +1730,41 @@ border: none;
 </nav>
 <!-- Mobile Navigation -->
 <div class="mobile-nav" id="mobileNav">
-<a href="#about" onclick="closeMobileNav()">Nossa Historia</a>
-<a href="#services" onclick="closeMobileNav()">Servicos</a>
+<a href="#about" onclick="closeMobileNav()">Nossa História</a>
+<a href="#services" onclick="closeMobileNav()">Serviços</a>
 <a href="#gallery" onclick="closeMobileNav()">Galeria</a>
-<a href="#team" onclick="closeMobileNav()">Barbeiros</a>
-<a href="#testimonials" onclick="closeMobileNav()">Avaliacoes</a>
-<a href="#booking" onclick="closeMobileNav()">Agendar</a>
+<a href="#team" onclick="closeMobileNav()">Equipe</a>
+<a href="#testimonials" onclick="closeMobileNav()">Avaliações</a>
+<a href="https://wa.me/554888721165" target="_blank" onclick="closeMobileNav()">Agendar</a>
 </div>
 <!-- Hero Section -->
 <section class="hero">
 <div class="hero-content">
 <div class="hero-tag">
 <span class="hero-tag-line"></span>
-<span class="hero-tag-text">Desde 2018 -- Cuidado Masculino Premium</span>
+<span class="hero-tag-text">Florianópolis, SC -- Barbearia Premium</span>
 </div>
 <h1 class="hero-title">
-<span>ONDE A ARTE</span>
-<span>ENCONTRA</span>
-<span class="title-stroke">&amp; TRADICAO</span>
+<span>ONDE O OFÍCIO</span>
+<span>ENCONTRA A </span>
+<span class="title-stroke">&amp; TRADIÇÃO</span>
 </h1>
 <p class="hero-desc">
-                Entre em um mundo onde cada corte conta uma historia. Nossos mestres barbeiros combinam tecnicas tradicionais com arte contemporanea para criar o seu visual assinatura.
+                Na Lumify Barbearia, cada corte conta uma história. Nossos barbeiros mestres combinam técnicas tradicionais com arte contemporânea para criar o seu visual.
             </p>
 <div class="hero-actions">
-<a class="btn-primary" href="#booking">
-<span>Reserve sua Cadeira</span>
-<iconify-icon icon="solar:arrow-right-linear"></iconify-icon>
+<a class="btn-primary" href="https://wa.me/554888721165" target="_blank">
+<span>Agende pelo WhatsApp</span>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:arrow-right-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M4 12h16m0 0l-6-6m6 6l-6 6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 </a>
 <a class="btn-outline" href="#services">
-<span>Explorar Servicos</span>
-<iconify-icon icon="solar:arrow-right-linear"></iconify-icon>
+<span>Ver Serviços</span>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:arrow-right-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M4 12h16m0 0l-6-6m6 6l-6 6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 </a>
 </div>
 </div>
 <div class="hero-image">
-<img alt="Mestre barbeiro em acao" loading="eager" src="assets/photo-1621605815971-fbc98d6650_2ef33d15070f.avif"/>
+<img alt="Barbeiro mestre em ação" class="" loading="eager" src="assets/photo-1621605815971-fbc98d6650_2ef33d15070f.avif"/>
 </div>
 </section>
 <!-- Marquee -->
@@ -1307,21 +1772,21 @@ border: none;
 <div class="marquee-track">
 <div class="marquee-item">
 <span>Cuidado Premium</span><div class="dot"></div>
-<span>Toalha Quente</span><div class="dot"></div>
+<span>Barba Toalha Quente</span><div class="dot"></div>
 <span>Escultura de Barba</span><div class="dot"></div>
-<span>Cortes Classicos</span><div class="dot"></div>
+<span>Cortes Clássicos</span><div class="dot"></div>
 <span>Design Capilar</span><div class="dot"></div>
-<span>Experiencia de Luxo</span><div class="dot"></div>
+<span>Experiência de Luxo</span><div class="dot"></div>
 <span>Clube do Cavalheiro</span><div class="dot"></div>
 <span>Navalha</span><div class="dot"></div>
 </div>
 <div class="marquee-item">
 <span>Cuidado Premium</span><div class="dot"></div>
-<span>Toalha Quente</span><div class="dot"></div>
+<span>Barba Toalha Quente</span><div class="dot"></div>
 <span>Escultura de Barba</span><div class="dot"></div>
-<span>Cortes Classicos</span><div class="dot"></div>
+<span>Cortes Clássicos</span><div class="dot"></div>
 <span>Design Capilar</span><div class="dot"></div>
-<span>Experiencia de Luxo</span><div class="dot"></div>
+<span>Experiência de Luxo</span><div class="dot"></div>
 <span>Clube do Cavalheiro</span><div class="dot"></div>
 <span>Navalha</span><div class="dot"></div>
 </div>
@@ -1332,26 +1797,26 @@ border: none;
 <div class="about-images reveal">
 <img alt="Interior da barbearia" class="about-img-main" src="assets/photo-1503951914875-452162b0f3_6a26d7b8dbf9.avif"/>
 <img alt="Ferramentas de barbeiro" class="about-img-secondary" src="assets/photo-1599351431202-1e0f013789_d9786b1e3f2f.avif"/>
-<div class="about-accent">L&amp;B</div>
+<div class="about-accent">L</div>
 </div>
 <div class="about-content">
 <div class="section-tag reveal">
 <span class="section-tag-line"></span>
-<span class="section-tag-text">Nossa Historia</span>
+<span class="section-tag-text">Nossa História</span>
 </div>
 <h2 class="section-title reveal reveal-delay-1">
-                MAIS QUE UMA<br/>BARBEARIA.<br/>Um <span class="italic">Legado.</span>
+                MAIS QUE UMA<br/>BARBEARIA.<br/>Uma <span class="italic">Tradição.</span>
 </h2>
 <p class="about-text reveal reveal-delay-2">
-                Fundada no coracao da cidade, a Lumify &amp; Barbearia nasceu da paixao pela arte autentica e da conviccao de que todo homem merece uma experiencia de cuidado que vai alem do comum. Nossa barbearia e um santuario -- um lugar onde a tradicao e honrada, a conversa flui livremente e cada detalhe importa.
+                Fundada no coração de Florianópolis, a Lumify Barbearia nasceu da paixão pelo ofício autêntico e da crença de que todo homem merece uma experiência de cuidado que vai além do comum. Nosso espaço é um santuário -- um lugar onde a tradição é honrada, a conversa flui livremente e cada detalhe importa.
             </p>
 <p class="about-text reveal reveal-delay-3">
-                Das toalhas quentes ao toque final do talco, cada visita e coreografada com perfeicao. Nos nao apenas cortamos cabelo; nos construimos confianca, um cliente de cada vez.
+                Das toalhas quentes ao acabamento final, cada visita é coreografada com perfeição. Não apenas cortamos cabelo; construímos confiança, um cliente de cada vez.
             </p>
 <div class="about-stats reveal reveal-delay-4">
 <div class="">
 <div class="stat-number">7+</div>
-<div class="stat-label">Anos de Excelencia</div>
+<div class="stat-label">Anos de Excelência</div>
 </div>
 <div>
 <div class="stat-number">15K+</div>
@@ -1359,7 +1824,7 @@ border: none;
 </div>
 <div>
 <div class="stat-number">6</div>
-<div class="stat-label">Mestres Barbeiros</div>
+<div class="stat-label">Barbeiros Mestres</div>
 </div>
 </div>
 </div>
@@ -1373,91 +1838,91 @@ border: none;
 <span class="section-tag-text">O Que Oferecemos</span>
 </div>
 <h2 class="section-title reveal reveal-delay-1">
-                    NOSSOS <span class="italic">Servicos</span><br/>PREMIUM
+                    SERVIÇOS <span class="italic">Premium</span>
                 </h2>
 </div>
 <div class="services-header-right reveal reveal-delay-2">
-<p>Cada servico e feito com precisao e cuidado, usando apenas os melhores produtos e tecnicas comprovadas.</p>
+<p>Cada serviço é feito com precisão e cuidado, usando apenas os melhores produtos e técnicas comprovadas.</p>
 </div>
 </div>
 <div class="services-grid">
 <div class="service-card reveal">
-<iconify-icon class="service-icon" icon="solar:scissors-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
-<h3 class="service-name">CORTE ASSINATURA</h3>
-<p class="service-desc">Uma experiencia de corte personalizado com consulta, tratamento de toalha quente e estilizacao de precisao.</p>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:scissors-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6.654 1.633a.75.75 0 0 0-1.308.735l5.794 10.304l-2.708 4.815a3.751 3.751 0 1 0-.136 3.303L12 14.202l3.704 6.588a3.75 3.75 0 1 0-.136-3.303l-2.708-4.815l5.794-10.304a.75.75 0 0 0-1.308-.735L12 11.142z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
+<h3 class="service-name">CORTE EXCLUSIVO</h3>
+<p class="service-desc">Uma experiência de corte personalizada com consulta, toalha quente e estilização de precisão.</p>
 <div class="service-price-row">
-<span class="service-price">R$90</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">45 Min</span>
 </div>
 </div>
 <div class="service-card reveal reveal-delay-1">
-<iconify-icon class="service-icon" icon="solar:fire-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
-<h3 class="service-name">BARBA COM TOALHA QUENTE</h3>
-<p class="service-desc">Barba tradicional com navalha, preparacao com toalha quente, sabonete premium e balsamo pos-barba.</p>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:fire-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M12.832 21.801c3.126-.626 7.168-2.875 7.168-8.69c0-5.291-3.873-8.815-6.658-10.434c-.619-.36-1.342.113-1.342.828v1.828c0 1.442-.606 4.074-2.29 5.169c-.86.559-1.79-.278-1.894-1.298l-.086-.838c-.1-.974-1.092-1.565-1.87-.971C4.461 8.46 3 10.33 3 13.11C3 20.221 8.289 22 10.933 22q.232 0 .484-.015C10.111 21.874 8 21.064 8 18.444c0-2.05 1.495-3.435 2.631-4.11c.306-.18.663.055.663.41v.59c0 .45.175 1.155.59 1.637c.47.546 1.159-.026 1.214-.744c.018-.226.246-.37.442-.256c.641.375 1.46 1.175 1.46 2.473c0 2.048-1.129 2.99-2.168 3.357" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
+<h3 class="service-name">BARBA TOALHA QUENTE</h3>
+<p class="service-desc">Barba tradicional com navalha, preparo com toalha quente, creme premium e balm pós-barba.</p>
 <div class="service-price-row">
-<span class="service-price">R$110</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">50 Min</span>
 </div>
 </div>
 <div class="service-card reveal reveal-delay-2">
-<iconify-icon class="service-icon" icon="solar:crown-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:crown-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="m20.092 14.326l.193-1.894c.103-1.011.17-1.678.117-2.099h.02c.871 0 1.578-.746 1.578-1.666S21.293 7 20.421 7s-1.579.746-1.579 1.667c0 .416.145.797.384 1.089c-.343.223-.792.695-1.468 1.405c-.52.547-.78.82-1.07.863a.84.84 0 0 1-.473-.07c-.268-.124-.447-.462-.804-1.139L13.527 7.25c-.22-.417-.405-.766-.572-1.047c.683-.368 1.15-1.117 1.15-1.98C14.105 2.994 13.163 2 12 2s-2.105.995-2.105 2.222c0 .864.467 1.613 1.15 1.98c-.167.282-.351.631-.572 1.048L8.59 10.816c-.358.676-.537 1.014-.805 1.139a.84.84 0 0 1-.473.07c-.29-.043-.55-.317-1.07-.864c-.676-.71-1.125-1.182-1.468-1.405c.24-.292.384-.673.384-1.09C5.158 7.747 4.45 7 3.578 7C2.708 7 2 7.746 2 8.667c0 .92.707 1.666 1.579 1.666h.019c-.054.42.014 1.088.117 2.099l.193 1.894c.107 1.051.196 2.051.306 2.952h15.572c.11-.9.199-1.901.306-2.952M10.855 22h2.29c2.985 0 4.478 0 5.474-.94c.434-.412.71-1.152.908-2.116H4.473c.198.964.473 1.704.908 2.115C6.377 22 7.87 22 10.855 22" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 <h3 class="service-name">ESCULTURA DE BARBA</h3>
-<p class="service-desc">Modelagem, aparagem e condicionamento especializado da barba com oleos e balsamos premium para o perfil perfeito.</p>
+<p class="service-desc">Modelagem, aparagem e condicionamento especializado da barba com óleos e balms premium.</p>
 <div class="service-price-row">
-<span class="service-price">R$70</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">30 Min</span>
 </div>
 </div>
 <div class="service-card reveal reveal-delay-3">
-<iconify-icon class="service-icon" icon="solar:star-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 <h3 class="service-name">O ROYAL</h3>
-<p class="service-desc">Nosso pacote completo: corte assinatura, barba com toalha quente, cuidado com a barba, tratamento facial e massagem no couro cabeludo.</p>
+<p class="service-desc">Nosso pacote completo: corte exclusivo, barba quente, cuidado com a barba, tratamento facial e massagem capilar.</p>
 <div class="service-price-row">
-<span class="service-price">R$190</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">90 Min</span>
 </div>
 </div>
 <div class="service-card reveal">
-<iconify-icon class="service-icon" icon="solar:pallete-2-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:pallete-2-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M10.847 21.934C5.867 21.362 2 17.133 2 12C2 6.477 6.477 2 12 2s10 4.477 10 10c0 5.157-3.283 4.733-6.086 4.37c-1.618-.209-3.075-.397-3.652.518c-.395.626.032 1.406.555 1.929a1.673 1.673 0 0 1 0 2.366c-.523.523-1.235.836-1.97.751M11.085 7a1.5 1.5 0 1 1-3 0a1.5 1.5 0 0 1 3 0M6.5 13a1.5 1.5 0 1 0 0-3a1.5 1.5 0 0 0 0 3m11 0a1.5 1.5 0 1 0 0-3a1.5 1.5 0 0 0 0 3m-3-4.5a1.5 1.5 0 1 0 0-3a1.5 1.5 0 0 0 0 3" fill="currentColor" fill-rule="evenodd"></path></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 <h3 class="service-name">DESIGN CAPILAR</h3>
-<p class="service-desc">Fades criativos, padroes e designs artisticos feitos pelos nossos estilistas mais habilidosos.</p>
+<p class="service-desc">Degradês criativos, padrões e designs artísticos feitos por nossos estilistas mais habilidosos.</p>
 <div class="service-price-row">
-<span class="service-price">R$120</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">60 Min</span>
 </div>
 </div>
 <div class="service-card reveal reveal-delay-1">
-<iconify-icon class="service-icon" icon="solar:waterdrop-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:waterdrop-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M11.612 22C6.855 22 3 18.057 3 13.193v-.265C3 8.317 5.729 4.163 9.903 2.421a5.43 5.43 0 0 1 4.194 0C18.272 4.163 21 8.317 21 12.928v.265C21 18.057 17.145 22 12.389 22zm.454-16.039a.75.75 0 0 1-.366.996c-1.545.715-2.793 2.168-3.37 3.993a.75.75 0 1 1-1.43-.453c.692-2.186 2.206-3.993 4.17-4.901a.75.75 0 0 1 .996.365" fill="currentColor" fill-rule="evenodd"></path></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 <h3 class="service-name">TRATAMENTO CAPILAR</h3>
-<p class="service-desc">Terapia profunda de limpeza do couro cabeludo com esfoliacao, oleos essenciais e massagem relaxante nos pontos de pressao.</p>
+<p class="service-desc">Terapia de limpeza capilar profunda com esfoliação, óleos essenciais e massagem relaxante.</p>
 <div class="service-price-row">
-<span class="service-price">R$80</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">35 Min</span>
 </div>
 </div>
 <div class="service-card reveal reveal-delay-2">
-<iconify-icon class="service-icon" icon="solar:magic-stick-3-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:magic-stick-3-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M3.845 3.845a2.883 2.883 0 0 0 0 4.077L5.432 9.51l.038-.04l4-4l.04-.038l-1.588-1.587a2.883 2.883 0 0 0-4.077 0m6.723 2.645l-.038.04l-4 4l-.04.038l9.588 9.588a2.884 2.884 0 0 0 4.078-4.078zM16.1 2.307a.483.483 0 0 1 .9 0l.43 1.095a.48.48 0 0 0 .272.274l1.091.432a.486.486 0 0 1 0 .903l-1.09.432a.5.5 0 0 0-.273.273L17 6.81a.483.483 0 0 1-.9 0l-.43-1.095a.5.5 0 0 0-.273-.273l-1.09-.432a.486.486 0 0 1 0-.903l1.09-.432a.5.5 0 0 0 .273-.274zm3.867 6.823a.483.483 0 0 1 .9 0l.156.399c.05.125.148.224.273.273l.398.158a.486.486 0 0 1 0 .902l-.398.158a.5.5 0 0 0-.273.273l-.156.4a.483.483 0 0 1-.9 0l-.157-.4a.5.5 0 0 0-.272-.273l-.398-.158a.486.486 0 0 1 0-.902l.398-.158a.5.5 0 0 0 .272-.273zM5.133 15.307a.483.483 0 0 1 .9 0l.157.4a.48.48 0 0 0 .272.273l.398.157a.486.486 0 0 1 0 .903l-.398.158a.48.48 0 0 0-.272.273l-.157.4a.483.483 0 0 1-.9 0l-.157-.4a.48.48 0 0 0-.272-.273l-.398-.158a.486.486 0 0 1 0-.903l.398-.157a.48.48 0 0 0 .272-.274z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 <h3 class="service-name">CAMUFLAGEM DE FIOS BRANCOS</h3>
-<p class="service-desc">Camuflagem natural dos fios brancos usando produtos premium para uma aparencia renovada e jovem.</p>
+<p class="service-desc">Camuflagem natural dos fios brancos usando produtos premium para uma aparência renovada.</p>
 <div class="service-price-row">
-<span class="service-price">R$100</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">40 Min</span>
 </div>
 </div>
 <div class="service-card reveal reveal-delay-3">
-<iconify-icon class="service-icon" icon="solar:face-scan-circle-bold"></iconify-icon>
-<iconify-icon class="service-arrow" icon="solar:arrow-right-up-linear"></iconify-icon>
+<svg aria-hidden="true" class="iconify service-icon iconify--solar" data-icon="solar:face-scan-circle-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><g clip-rule="evenodd" fill="currentColor" fill-rule="evenodd"><path d="M10.801 2.57a.71.71 0 0 1-.555.838a8.78 8.78 0 0 0-6.838 6.838a.71.71 0 1 1-1.394-.283a10.2 10.2 0 0 1 7.949-7.949a.71.71 0 0 1 .838.556M2.57 13.199a.71.71 0 0 1 .838.555a8.78 8.78 0 0 0 6.838 6.838a.71.71 0 1 1-.283 1.394a10.2 10.2 0 0 1-7.948-7.949a.71.71 0 0 1 .555-.838M13.199 2.57a.71.71 0 0 1 .838-.556a10.2 10.2 0 0 1 7.949 7.949a.711.711 0 0 1-1.394.283a8.78 8.78 0 0 0-6.838-6.838a.71.71 0 0 1-.555-.838m8.231 10.629a.71.71 0 0 1 .556.838a10.2 10.2 0 0 1-7.949 7.949a.711.711 0 0 1-.283-1.394a8.78 8.78 0 0 0 6.838-6.838a.71.71 0 0 1 .838-.555"></path><path d="M12 19.583a7.583 7.583 0 1 0 0-15.166a7.583 7.583 0 0 0 0 15.166m-3.06-5.044a.71.71 0 0 1 .995-.148c.59.437 1.3.69 2.065.69a3.45 3.45 0 0 0 2.065-.69a.71.71 0 1 1 .846 1.142a4.87 4.87 0 0 1-2.911.97a4.87 4.87 0 0 1-2.911-.97a.71.71 0 0 1-.148-.994m6.377-4.139c0 .688-.37 1.245-.829 1.245s-.83-.557-.83-1.245c0-.687.372-1.244.83-1.244s.83.557.83 1.244m-5.805 1.245c.458 0 .83-.557.83-1.245c0-.687-.372-1.244-.83-1.244s-.83.557-.83 1.244c0 .688.372 1.245.83 1.245"></path></g></svg>
+<svg aria-hidden="true" class="iconify service-arrow iconify--solar" data-icon="solar:arrow-right-up-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M6 18L18 6m0 0H9m9 0v9" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 <h3 class="service-name">CUIDADO FACIAL</h3>
-<p class="service-desc">Cuidado facial completo incluindo limpeza, esfoliacao, mascara e hidratacao para uma pele saudavel.</p>
+<p class="service-desc">Cuidado facial completo incluindo limpeza, esfoliação, máscara e hidratação para uma pele saudável.</p>
 <div class="service-price-row">
-<span class="service-price">R$90</span>
+<span class="service-price">Sob consulta</span>
 <span class="service-duration">40 Min</span>
 </div>
 </div>
@@ -1471,13 +1936,13 @@ border: none;
 <span class="section-tag-text">Nosso Trabalho</span>
 <span class="section-tag-line"></span>
 </div>
-<h2 class="section-title reveal reveal-delay-1">A <span class="italic">Arte</span> EM DETALHES</h2>
+<h2 class="section-title reveal reveal-delay-1">O <span class="italic">Ofício</span> EM DETALHES</h2>
 </div>
 <div class="gallery-grid">
 <div class="gallery-item reveal">
-<img alt="Corte fade classico" src="assets/photo-1622286342621-4bd786c244_49252f554553.avif"/>
+<img alt="Corte degradê clássico" src="assets/photo-1622286342621-4bd786c244_49252f554553.avif"/>
 <div class="gallery-overlay">
-<span class="gallery-overlay-text">FADE DE PRECISAO</span>
+<span class="gallery-overlay-text">DEGRADÊ DE PRECISÃO</span>
 </div>
 </div>
 <div class="gallery-item reveal reveal-delay-1">
@@ -1493,15 +1958,15 @@ border: none;
 </div>
 </div>
 <div class="gallery-item reveal reveal-delay-1">
-<img alt="Atmosfera da barbearia" src="assets/photo-1633681926022-84c23e8cb2_d17fc64bbeff.avif"/>
+<img alt="Ambiente da barbearia" src="assets/photo-1633681926022-84c23e8cb2_d17fc64bbeff.avif"/>
 <div class="gallery-overlay">
-<span class="gallery-overlay-text">A EXPERIENCIA</span>
+<span class="gallery-overlay-text">A EXPERIÊNCIA</span>
 </div>
 </div>
 <div class="gallery-item reveal reveal-delay-2">
-<img alt="Detalhes de estilizacao" src="assets/photo-1493256338651-d82f7acb2b_8c40485c6ec9.avif"/>
+<img alt="Detalhes de estilo" src="assets/photo-1493256338651-d82f7acb2b_8c40485c6ec9.avif"/>
 <div class="gallery-overlay">
-<span class="gallery-overlay-text">TOQUES FINAIS</span>
+<span class="gallery-overlay-text">ACABAMENTO PERFEITO</span>
 </div>
 </div>
 </div>
@@ -1514,49 +1979,49 @@ border: none;
 <span class="section-tag-line"></span>
 <span class="section-tag-text">A Equipe</span>
 </div>
-<h2 class="section-title reveal reveal-delay-1">CONHECA NOSSOS <span class="italic">Mestres</span><br/>BARBEIROS</h2>
+<h2 class="section-title reveal reveal-delay-1">CONHEÇA NOSSOS <span class="italic">Barbeiros</span><br/>MESTRES</h2>
 </div>
 </div>
 <div class="team-grid">
 <div class="team-card reveal">
 <div class="team-card-img">
-<img alt="Rafael Santos" class="object-cover bg-center" src="assets/photo-1557862921-37829c790f19_09279be69e29.jpg"/>
+<img alt="Rafael" class="object-cover bg-center" src="assets/photo-1557862921-37829c790f19_09279be69e29.jpg"/>
 </div>
 <div class="team-card-info">
 <div>
-<div class="team-card-name">RAFAEL SANTOS</div>
+<div class="team-card-name">RAFAEL</div>
 <div class="team-card-role">Fundador &amp; Barbeiro Chefe</div>
 </div>
 <div class="team-card-socials">
-<a href="#"><iconify-icon icon="solar:chat-round-dots-bold"></iconify-icon></a>
+<a href="https://wa.me/554888721165" target="_blank"><svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:chat-round-dots-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><defs><mask id="IconifyId19c668d3a56232cb50"><g fill="none"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2S2 6.477 2 12c0 1.6.376 3.112 1.043 4.453c.178.356.237.763.134 1.148l-.595 2.226a1.3 1.3 0 0 0 1.591 1.592l2.226-.596a1.63 1.63 0 0 1 1.149.133A9.96 9.96 0 0 0 12 22" fill="#fff"></path><path d="M15 12a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0" fill="#000"></path></g></mask></defs><path d="M0 0h24v24H0z" fill="currentColor" mask="url(#IconifyId19c668d3a56232cb50)"></path></svg></a>
 </div>
 </div>
 </div>
 <div class="team-card reveal reveal-delay-1">
 <div class="team-card-img">
-<img alt="Lucas Oliveira" class="object-cover bg-center" src="assets/photo-1597116648852-75764ecaf6_76921d88f400.jpg"/>
+<img alt="Lucas" class="object-cover bg-center" src="assets/photo-1597116648852-75764ecaf6_76921d88f400.jpg"/>
 </div>
 <div class="team-card-info">
 <div>
-<div class="team-card-name">LUCAS OLIVEIRA</div>
-<div class="team-card-role">Estilista Senior</div>
+<div class="team-card-name">LUCAS</div>
+<div class="team-card-role">Estilista Sênior</div>
 </div>
 <div class="team-card-socials">
-<a href="#"><iconify-icon icon="solar:chat-round-dots-bold"></iconify-icon></a>
+<a href="https://wa.me/554888721165" target="_blank"><svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:chat-round-dots-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><defs><mask id="IconifyId19c668d3a56232cb51"><g fill="none"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2S2 6.477 2 12c0 1.6.376 3.112 1.043 4.453c.178.356.237.763.134 1.148l-.595 2.226a1.3 1.3 0 0 0 1.591 1.592l2.226-.596a1.63 1.63 0 0 1 1.149.133A9.96 9.96 0 0 0 12 22" fill="#fff"></path><path d="M15 12a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0" fill="#000"></path></g></mask></defs><path d="M0 0h24v24H0z" fill="currentColor" mask="url(#IconifyId19c668d3a56232cb51)"></path></svg></a>
 </div>
 </div>
 </div>
 <div class="team-card reveal reveal-delay-2">
 <div class="team-card-img">
-<img alt="Matheus Costa" class="object-cover bg-center" src="assets/photo-1600180758890-6b94519a8b_04e812884c97.jpg"/>
+<img alt="Matheus" class="object-cover bg-center" src="assets/photo-1600180758890-6b94519a8b_04e812884c97.jpg"/>
 </div>
 <div class="team-card-info">
 <div>
-<div class="team-card-name">MATHEUS COSTA</div>
+<div class="team-card-name">MATHEUS</div>
 <div class="team-card-role">Especialista em Barba</div>
 </div>
 <div class="team-card-socials">
-<a href="#"><iconify-icon icon="solar:chat-round-dots-bold"></iconify-icon></a>
+<a href="https://wa.me/554888721165" target="_blank"><svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:chat-round-dots-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><defs><mask id="IconifyId19c668d3a56232cb52"><g fill="none"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2S2 6.477 2 12c0 1.6.376 3.112 1.043 4.453c.178.356.237.763.134 1.148l-.595 2.226a1.3 1.3 0 0 0 1.591 1.592l2.226-.596a1.63 1.63 0 0 1 1.149.133A9.96 9.96 0 0 0 12 22" fill="#fff"></path><path d="M15 12a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0" fill="#000"></path></g></mask></defs><path d="M0 0h24v24H0z" fill="currentColor" mask="url(#IconifyId19c668d3a56232cb52)"></path></svg></a>
 </div>
 </div>
 </div>
@@ -1564,7 +2029,7 @@ border: none;
 </section>
 <!-- Testimonials Section -->
 <section class="testimonials" id="testimonials">
-<div class="testimonial-bg-text">AVALIACOES</div>
+<div class="testimonial-bg-text">DEPOIMENTOS</div>
 <div class="testimonials-header">
 <div class="section-tag reveal" style="justify-content: center;">
 <span class="section-tag-line"></span>
@@ -1574,45 +2039,45 @@ border: none;
 <h2 class="section-title reveal reveal-delay-1">O QUE NOSSOS <span class="italic">Clientes</span> DIZEM</h2>
 </div>
 <div class="testimonial-slider">
-<div class="testimonial-item active">
+<div class="testimonial-item">
 <div class="testimonial-stars">
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
 </div>
-<p class="testimonial-quote">"A Lumify &amp; Barbearia nao e apenas uma barbearia -- e uma experiencia. Do momento em que voce entra, sente a atencao aos detalhes. Rafael e sua equipe sao verdadeiros artistas. Eu nao confiaria meu cabelo a mais ninguem."</p>
-<div class="testimonial-author-name">FELIPE ALMEIDA</div>
+<p class="testimonial-quote">"A Lumify Barbearia não é apenas uma barbearia -- é uma experiência. Desde o momento em que você entra, sente a atenção aos detalhes. Rafael e sua equipe são verdadeiros artistas. Não confiaria meu cabelo a ninguém mais."</p>
+<div class="testimonial-author-name">GABRIEL SANTOS</div>
 <div class="testimonial-author-title">Cliente desde 2019</div>
 </div>
 <div class="testimonial-item">
 <div class="testimonial-stars">
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
 </div>
-<p class="testimonial-quote">"O pacote Royal vale cada centavo. Barba com toalha quente, o fade perfeito e uma massagem no couro cabeludo que derrete o estresse. Isso e o que o cuidado masculino premium deveria ser. A melhor barbearia da cidade, sem duvida."</p>
-<div class="testimonial-author-name">GUSTAVO PEREIRA</div>
+<p class="testimonial-quote">"O pacote Royal vale cada centavo. Barba com toalha quente, o degradê perfeito e uma massagem capilar que derrete o estresse. É assim que o cuidado premium deveria ser. A melhor barbearia da cidade, sem dúvida."</p>
+<div class="testimonial-author-name">FELIPE OLIVEIRA</div>
 <div class="testimonial-author-title">Cliente desde 2020</div>
 </div>
 <div class="testimonial-item">
 <div class="testimonial-stars">
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
-<iconify-icon icon="solar:star-bold"></iconify-icon>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:star-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M9.153 5.408C10.42 3.136 11.053 2 12 2s1.58 1.136 2.847 3.408l.328.588c.36.646.54.969.82 1.182s.63.292 1.33.45l.636.144c2.46.557 3.689.835 3.982 1.776c.292.94-.546 1.921-2.223 3.882l-.434.507c-.476.557-.715.836-.822 1.18c-.107.345-.071.717.001 1.46l.066.677c.253 2.617.38 3.925-.386 4.506s-1.918.051-4.22-1.009l-.597-.274c-.654-.302-.981-.452-1.328-.452s-.674.15-1.328.452l-.596.274c-2.303 1.06-3.455 1.59-4.22 1.01c-.767-.582-.64-1.89-.387-4.507l.066-.676c.072-.744.108-1.116 0-1.46c-.106-.345-.345-.624-.821-1.18l-.434-.508c-1.677-1.96-2.515-2.941-2.223-3.882S3.58 8.328 6.04 7.772l.636-.144c.699-.158 1.048-.237 1.329-.45s.46-.536.82-1.182z" fill="currentColor"></path></svg>
 </div>
-<p class="testimonial-quote">"Ja fui em barbearias pelo mundo inteiro, e a Lumify &amp; Barbearia esta entre as melhores. A atmosfera, a habilidade, a conversa -- tudo se encaixa perfeitamente. Lucas transformou minha barba em uma obra de arte."</p>
-<div class="testimonial-author-name">ANDRE RIBEIRO</div>
+<p class="testimonial-quote">"Já fui a barbearias pelo mundo todo, e a Lumify Barbearia está entre as melhores. O ambiente, a habilidade, a conversa -- tudo se encaixa perfeitamente. Lucas transformou minha barba em uma obra de arte."</p>
+<div class="testimonial-author-name">ANDRÉ COSTA</div>
 <div class="testimonial-author-title">Cliente desde 2021</div>
 </div>
 </div>
 <div class="testimonial-nav" id="testimonialNav">
-<button class="testimonial-dot active" data-index="0"></button>
+<button class="testimonial-dot" data-index="0"></button>
 <button class="testimonial-dot" data-index="1"></button>
 <button class="testimonial-dot" data-index="2"></button>
 </div>
@@ -1626,14 +2091,14 @@ border: none;
 <div class="booking-form-wrapper">
 <div class="section-tag reveal">
 <span class="section-tag-line"></span>
-<span class="section-tag-text">Reserve seu Lugar</span>
+<span class="section-tag-text">Reserve Seu Horário</span>
 </div>
 <h2 class="section-title reveal reveal-delay-1">AGENDE SUA <span class="italic">Visita</span></h2>
 <form class="booking-form reveal reveal-delay-2" onsubmit="event.preventDefault();">
 <div class="form-row">
 <div class="form-group">
 <label>Nome</label>
-<input placeholder="Joao" type="text"/>
+<input placeholder="João" type="text"/>
 </div>
 <div class="form-group">
 <label>Sobrenome</label>
@@ -1643,34 +2108,34 @@ border: none;
 <div class="form-row">
 <div class="form-group">
 <label>Email</label>
-<input placeholder="contato@lumifycompany.com.br" type="email"/>
+<input placeholder="contato@exemplo.com" type="email"/>
 </div>
 <div class="form-group">
-<label>Telefone</label>
-<input placeholder="+55 (48) 8872-1165" type="tel"/>
+<label>WhatsApp</label>
+<input placeholder="(48) 99999-9999" type="tel"/>
 </div>
 </div>
 <div class="form-group">
-<label>Selecione o Servico</label>
+<label>Selecione o Serviço</label>
 <select>
-<option value="">Escolha um servico...</option>
-<option value="signature">Corte Assinatura -- R$90</option>
-<option value="shave">Barba com Toalha Quente -- R$110</option>
-<option value="beard">Escultura de Barba -- R$70</option>
-<option value="royal">O Royal -- R$190</option>
-<option value="design">Design Capilar -- R$120</option>
-<option value="scalp">Tratamento Capilar -- R$80</option>
-<option value="grey">Camuflagem de Fios Brancos -- R$100</option>
-<option value="facial">Cuidado Facial -- R$90</option>
+<option value="">Escolha um serviço...</option>
+<option value="signature">Corte Exclusivo</option>
+<option value="shave">Barba Toalha Quente</option>
+<option value="beard">Escultura de Barba</option>
+<option value="royal">O Royal</option>
+<option value="design">Design Capilar</option>
+<option value="scalp">Tratamento Capilar</option>
+<option value="grey">Camuflagem de Fios Brancos</option>
+<option value="facial">Cuidado Facial</option>
 </select>
 </div>
 <div class="form-group">
 <label>Barbeiro Preferido</label>
 <select>
-<option value="">Sem preferencia</option>
-<option value="rafael">Rafael Santos</option>
-<option value="lucas">Lucas Oliveira</option>
-<option value="matheus">Matheus Costa</option>
+<option value="">Sem preferência</option>
+<option value="rafael">Rafael</option>
+<option value="lucas">Lucas</option>
+<option value="matheus">Matheus</option>
 </select>
 </div>
 <div class="form-row">
@@ -1679,13 +2144,13 @@ border: none;
 <input type="date"/>
 </div>
 <div class="form-group">
-<label>Horario</label>
+<label>Horário</label>
 <input type="time"/>
 </div>
 </div>
 <button class="btn-submit" type="submit">
 <span>Confirmar Agendamento</span>
-<iconify-icon icon="solar:arrow-right-linear"></iconify-icon>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:arrow-right-linear" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="M4 12h16m0 0l-6-6m6 6l-6 6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"></path></svg>
 </button>
 </form>
 </div>
@@ -1696,33 +2161,33 @@ border: none;
 <div class="instagram-header">
 <div class="section-tag reveal" style="justify-content: center;">
 <span class="section-tag-line"></span>
-<span class="section-tag-text">Nos Siga</span>
+<span class="section-tag-text">Siga-nos</span>
 <span class="section-tag-line"></span>
 </div>
 <h2 class="section-title reveal reveal-delay-1">NO <span class="italic">Instagram</span></h2>
-<a class="instagram-handle reveal reveal-delay-2" href="#">
-<iconify-icon icon="solar:camera-bold"></iconify-icon>
-                @lumifybarbearia
+<a class="instagram-handle reveal reveal-delay-2" href="https://www.instagram.com/lumifycompany/" target="_blank">
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:camera-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M9.778 21h4.444c3.121 0 4.682 0 5.803-.735a4.4 4.4 0 0 0 1.226-1.204c.749-1.1.749-2.633.749-5.697s0-4.597-.749-5.697a4.4 4.4 0 0 0-1.226-1.204c-.72-.473-1.622-.642-3.003-.702c-.659 0-1.226-.49-1.355-1.125A2.064 2.064 0 0 0 13.634 3h-3.268c-.988 0-1.839.685-2.033 1.636c-.129.635-.696 1.125-1.355 1.125c-1.38.06-2.282.23-3.003.702A4.4 4.4 0 0 0 2.75 7.667C2 8.767 2 10.299 2 13.364s0 4.596.749 5.697c.324.476.74.885 1.226 1.204C5.096 21 6.657 21 9.778 21M12 9.273c-2.301 0-4.167 1.831-4.167 4.09S9.7 17.456 12 17.456s4.167-1.832 4.167-4.091S14.3 9.273 12 9.273m0 1.636c-1.38 0-2.5 1.099-2.5 2.455c0 1.355 1.12 2.454 2.5 2.454s2.5-1.099 2.5-2.454s-1.12-2.455-2.5-2.455m4.722-.818c0-.452.373-.818.834-.818h1.11c.46 0 .834.366.834.818a.826.826 0 0 1-.833.818h-1.111a.826.826 0 0 1-.834-.818" fill="currentColor" fill-rule="evenodd"></path></svg>
+                @lumifycompany
             </a>
 </div>
 <div class="instagram-grid">
 <div class="instagram-item">
-<img alt="Post do Instagram" loading="lazy" src="assets/photo-1621605815971-fbc98d6650_df200a8ce972.jpg"/>
+<img alt="Instagram post" loading="lazy" src="assets/photo-1621605815971-fbc98d6650_df200a8ce972.jpg"/>
 </div>
 <div class="instagram-item">
-<img alt="Post do Instagram" loading="lazy" src="assets/photo-1622286342621-4bd786c244_af49aaaf1826.jpg"/>
+<img alt="Instagram post" loading="lazy" src="assets/photo-1622286342621-4bd786c244_af49aaaf1826.jpg"/>
 </div>
 <div class="instagram-item">
-<img alt="Post do Instagram" loading="lazy" src="assets/photo-1599351431202-1e0f013789_12f22dc1e8ca.jpg"/>
+<img alt="Instagram post" loading="lazy" src="assets/photo-1599351431202-1e0f013789_12f22dc1e8ca.jpg"/>
 </div>
 <div class="instagram-item">
-<img alt="Post do Instagram" loading="lazy" src="assets/photo-1503951914875-452162b0f3_ad68379d68f9.jpg"/>
+<img alt="Instagram post" loading="lazy" src="assets/photo-1503951914875-452162b0f3_ad68379d68f9.jpg"/>
 </div>
 <div class="instagram-item">
-<img alt="Post do Instagram" loading="lazy" src="assets/photo-1605497788044-5a32c70784_bf2592badfe2.jpg"/>
+<img alt="Instagram post" loading="lazy" src="assets/photo-1605497788044-5a32c70784_bf2592badfe2.jpg"/>
 </div>
 <div class="instagram-item">
-<img alt="Post do Instagram" loading="lazy" src="assets/photo-1493256338651-d82f7acb2b_f48db52b0712.jpg"/>
+<img alt="Instagram post" loading="lazy" src="assets/photo-1493256338651-d82f7acb2b_f48db52b0712.jpg"/>
 </div>
 </div>
 </section>
@@ -1731,29 +2196,27 @@ border: none;
 <div class="footer-top">
 <div>
 <div class="footer-brand-name">LUMIFY <span class="gold">&amp;</span> BARBEARIA</div>
-<p class="footer-brand-desc">Onde a tradicao encontra a arte moderna. Experiencias premium de cuidado masculino para o cavalheiro distinto desde 2018.</p>
+<p class="footer-brand-desc">Onde a tradição encontra o ofício moderno. Experiências premium de cuidado masculino em Florianópolis.</p>
 <div class="footer-socials">
-<a href="#"><iconify-icon icon="solar:camera-bold"></iconify-icon></a>
-<a href="#"><iconify-icon icon="solar:chat-round-dots-bold"></iconify-icon></a>
-<a href="#"><iconify-icon icon="solar:share-bold"></iconify-icon></a>
-<a href="#"><iconify-icon icon="solar:play-bold"></iconify-icon></a>
+<a href="https://www.instagram.com/lumifycompany/" target="_blank"><svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:camera-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M9.778 21h4.444c3.121 0 4.682 0 5.803-.735a4.4 4.4 0 0 0 1.226-1.204c.749-1.1.749-2.633.749-5.697s0-4.597-.749-5.697a4.4 4.4 0 0 0-1.226-1.204c-.72-.473-1.622-.642-3.003-.702c-.659 0-1.226-.49-1.355-1.125A2.064 2.064 0 0 0 13.634 3h-3.268c-.988 0-1.839.685-2.033 1.636c-.129.635-.696 1.125-1.355 1.125c-1.38.06-2.282.23-3.003.702A4.4 4.4 0 0 0 2.75 7.667C2 8.767 2 10.299 2 13.364s0 4.596.749 5.697c.324.476.74.885 1.226 1.204C5.096 21 6.657 21 9.778 21M12 9.273c-2.301 0-4.167 1.831-4.167 4.09S9.7 17.456 12 17.456s4.167-1.832 4.167-4.091S14.3 9.273 12 9.273m0 1.636c-1.38 0-2.5 1.099-2.5 2.455c0 1.355 1.12 2.454 2.5 2.454s2.5-1.099 2.5-2.454s-1.12-2.455-2.5-2.455m4.722-.818c0-.452.373-.818.834-.818h1.11c.46 0 .834.366.834.818a.826.826 0 0 1-.833.818h-1.111a.826.826 0 0 1-.834-.818" fill="currentColor" fill-rule="evenodd"></path></svg></a>
+<a href="https://wa.me/554888721165" target="_blank"><svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:chat-round-dots-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><defs><mask id="IconifyId19c668d3a56232cb53"><g fill="none"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2S2 6.477 2 12c0 1.6.376 3.112 1.043 4.453c.178.356.237.763.134 1.148l-.595 2.226a1.3 1.3 0 0 0 1.591 1.592l2.226-.596a1.63 1.63 0 0 1 1.149.133A9.96 9.96 0 0 0 12 22" fill="#fff"></path><path d="M15 12a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0m-4 0a1 1 0 1 0 2 0a1 1 0 0 0-2 0" fill="#000"></path></g></mask></defs><path d="M0 0h24v24H0z" fill="currentColor" mask="url(#IconifyId19c668d3a56232cb53)"></path></svg></a>
 </div>
 </div>
 <div class="footer-col">
-<div class="footer-col-title">LINKS RAPIDOS</div>
+<div class="footer-col-title">LINKS RÁPIDOS</div>
 <ul>
-<li><a href="#about">Nossa Historia</a></li>
-<li><a href="#services">Servicos</a></li>
+<li><a href="#about">Nossa História</a></li>
+<li><a href="#services">Serviços</a></li>
 <li><a href="#gallery">Galeria</a></li>
-<li><a href="#team">Nossos Barbeiros</a></li>
-<li><a href="#booking">Agendar Online</a></li>
+<li><a href="#team">Nossa Equipe</a></li>
+<li><a href="https://wa.me/554888721165" target="_blank">Agendar pelo WhatsApp</a></li>
 </ul>
 </div>
 <div class="footer-col">
-<div class="footer-col-title">SERVICOS</div>
+<div class="footer-col-title">SERVIÇOS</div>
 <ul>
-<li><a href="#services">Corte Assinatura</a></li>
-<li><a href="#services">Barba com Toalha Quente</a></li>
+<li><a href="#services">Corte Exclusivo</a></li>
+<li><a href="#services">Barba Toalha Quente</a></li>
 <li><a href="#services">Escultura de Barba</a></li>
 <li><a href="#services">O Royal</a></li>
 <li><a href="#services">Design Capilar</a></li>
@@ -1762,24 +2225,24 @@ border: none;
 <div class="footer-col">
 <div class="footer-col-title">VISITE-NOS</div>
 <div class="footer-contact-item">
-<iconify-icon icon="solar:map-point-bold"></iconify-icon>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:map-point-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path clip-rule="evenodd" d="M12 2c-4.418 0-8 4.003-8 8.5c0 4.462 2.553 9.312 6.537 11.174a3.45 3.45 0 0 0 2.926 0C17.447 19.812 20 14.962 20 10.5C20 6.003 16.418 2 12 2m0 10a2 2 0 1 0 0-4a2 2 0 0 0 0 4" fill="currentColor" fill-rule="evenodd"></path></svg>
 <p>Florianópolis, SC</p>
 </div>
 <div class="footer-contact-item">
-<iconify-icon icon="solar:phone-bold"></iconify-icon>
-<p>+55 (48) 8872-1165</p>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:phone-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><path d="m16.556 12.906l-.455.453s-1.083 1.076-4.038-1.862s-1.872-4.014-1.872-4.014l.286-.286c.707-.702.774-1.83.157-2.654L9.374 2.86C8.61 1.84 7.135 1.705 6.26 2.575l-1.57 1.56c-.433.432-.723.99-.688 1.61c.09 1.587.808 5 4.812 8.982c4.247 4.222 8.232 4.39 9.861 4.238c.516-.048.964-.31 1.325-.67l1.42-1.412c.96-.953.69-2.588-.538-3.255l-1.91-1.039c-.806-.437-1.787-.309-2.417.317" fill="currentColor"></path></svg>
+<p><a href="https://wa.me/554888721165" target="_blank">(48) 8872-1165</a></p>
 </div>
 <div class="footer-contact-item">
-<iconify-icon icon="solar:clock-circle-bold"></iconify-icon>
-<p>Sex: 9h - 20h<br/>Sab: 9h - 18h<br/>Dom: 10h - 16h</p>
+<svg aria-hidden="true" class="iconify iconify--solar" data-icon="solar:clock-circle-bold" height="1em" role="img" viewbox="0 0 24 24" width="1em" xmlns="http://www.w3.org/2000/svg"><defs><mask id="IconifyId19c668d3a56232cb54"><g fill="none"><path d="M22 12c0 5.523-4.477 10-10 10S2 17.523 2 12S6.477 2 12 2s10 4.477 10 10" fill="#fff"></path><path clip-rule="evenodd" d="M12 7.25a.75.75 0 0 1 .75.75v3.69l2.28 2.28a.75.75 0 1 1-1.06 1.06l-2.5-2.5a.75.75 0 0 1-.22-.53V8a.75.75 0 0 1 .75-.75" fill="#000" fill-rule="evenodd"></path></g></mask></defs><path d="M0 0h24v24H0z" fill="currentColor" mask="url(#IconifyId19c668d3a56232cb54)"></path></svg>
+<p>Seg-Sex: 9h - 20h<br/>Sáb: 9h - 18h<br/>Dom: 10h - 16h</p>
 </div>
 </div>
 </div>
 <div class="footer-bottom">
-<p>2026 LUMIFY &amp; BARBEARIA. Todos os direitos reservados.</p>
+<p>© 2026 Todos os direitos reservados.</p>
 <div class="footer-bottom-links">
-<a href="#">Politica de Privacidade</a>
-<a href="#">Termos de Servico</a>
+<a href="#">Política de Privacidade</a>
+<a href="#">Termos de Serviço</a>
 </div>
 </div>
 </footer>
@@ -1909,4 +2372,4 @@ border: none;
 
         statNumbers.forEach(el => statsObserver.observe(el));
     </script>
-</body></html>
+<script data-img-fallback-handler="">!function(){var f=["https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/917d6f93-fb36-439a-8c48-884b67b35381_1600w.jpg","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/4734259a-bad7-422f-981e-ce01e79184f2_1600w.jpg","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/c543a9e1-f226-4ced-80b0-feb8445a75b9_1600w.jpg","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/5bab247f-35d9-400d-a82b-fd87cfe913d2_1600w.webp","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/30104e3c-5eea-4b93-93e9-5313698a7156_1600w.webp"],h=new Set;function g(s){for(var x=0,i=0;i<s.length;i++)x=(x<<5)-x+s.charCodeAt(i)|0;return f[Math.abs(x)%f.length]}function r(t){var s=t.src;if(s&&!h.has(s)){h.add(s);t.src=g(s)}}window.addEventListener("error",function(e){var t=e.target;if(t&&t.tagName==="IMG")r(t)},!0);function c(){document.querySelectorAll("img").forEach(function(i){if(i.complete&&!i.naturalWidth&&i.src)r(i)})}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",c);else c()}()</script></body></html>
